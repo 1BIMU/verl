@@ -22,7 +22,7 @@ import torch
 import torch.distributed
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
+from tensordict import TensorDict
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
@@ -232,12 +232,18 @@ class DataParallelPPOCritic(BasePPOCritic):
             "prompt_attention_mask": prompt_attention_mask,
             "prompt_position_ids": prompt_position_ids,
         }
+        current_batch_size = prompt_input_ids.shape[0] 
+        # 2. 将 dict 转换为 TensorDict
+        prompt_data_batch_td = TensorDict(
+            source=prompt_data_batch,
+            batch_size=[current_batch_size]
+        )
         prompt_data_non_tensor = {}
         if "multi_modal_inputs" in data.non_tensor_batch.keys():
             prompt_data_non_tensor["multi_modal_inputs"] = data.non_tensor_batch["multi_modal_inputs"]
         
         prompt_data = DataProto(
-            batch=prompt_data_batch,
+            batch=prompt_data_batch_td,
             non_tensor_batch=prompt_data_non_tensor,
             meta_info=data.meta_info
         )
@@ -314,9 +320,15 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                 # 目标 R (1或0)
                 R_targets = mini_batch.batch["returns"] # 形状 [mini_batch_size]
-
+                # 1. 获取 batch size
+                current_batch_size = prompt_input_ids.shape[0]
+                # 2. 将 dict 转换为 TensorDict
+                prompt_mb_batch_td = TensorDict(
+                    source=prompt_mb_batch,
+                    batch_size=[current_batch_size]
+                )
                 prompt_micro_batch_data = DataProto(
-                    batch=prompt_mb_batch,
+                    batch=prompt_mb_batch_td,
                     non_tensor_batch=prompt_mb_non_tensor,
                     meta_info=mini_batch.meta_info
                 )
