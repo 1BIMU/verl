@@ -36,7 +36,6 @@ This logic is largely copied from the Hendrycks' MATH release (math_equivalence)
 
 From: https://github.com/openai/prm800k/blob/main/prm800k/grading/math_normalize.py
 """
-
 import re
 from typing import Optional
 
@@ -47,11 +46,11 @@ def normalize_answer(answer: Optional[str]) -> Optional[str]:
     answer = answer.strip()
     try:
         # Remove enclosing `\text{}`.
-        m = re.search("^\\\\text\\{(?P<text>.+?)\\}$", answer)
+        m = re.search("^\\\\text\{(?P<text>.+?)\}$", answer)
         if m is not None:
             answer = m.group("text").strip()
         return _strip_string(answer)
-    except:  # noqa: E722
+    except:
         return answer
 
 
@@ -67,7 +66,7 @@ def _fix_fracs(string):
             else:
                 try:
                     assert len(substr) >= 2
-                except:  # noqa: E722
+                except:
                     return string
                 a = substr[0]
                 b = substr[1]
@@ -98,7 +97,7 @@ def _fix_a_slash_b(string):
         assert string == "{}/{}".format(a, b)
         new_string = "\\frac{" + str(a) + "}{" + str(b) + "}"
         return new_string
-    except:  # noqa: E722
+    except:
         return string
 
 
@@ -169,8 +168,9 @@ def _strip_string(string):
         string = "0" + string
 
     # to consider: get rid of e.g. "k = " or "q = " at beginning
-    if len(string.split("=")) == 2 and len(string.split("=")[0]) <= 2:
-        string = string.split("=")[1]
+    if len(string.split("=")) == 2:
+        if len(string.split("=")[0]) <= 2:
+            string = string.split("=")[1]
 
     # fix sqrt3 --> sqrt{3}
     string = _fix_sqrt(string)
@@ -178,8 +178,7 @@ def _strip_string(string):
     # remove spaces
     string = string.replace(" ", "")
 
-    # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1).
-    # Also does a/b --> \\frac{a}{b}
+    # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1). Also does a/b --> \\frac{a}{b}
     string = _fix_fracs(string)
 
     # manually change 0.5 --> \frac{1}{2}
