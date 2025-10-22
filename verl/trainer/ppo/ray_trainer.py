@@ -1154,6 +1154,10 @@ class RayPPOTrainer:
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
+                            # ----------------- MODIFICATION -----------------
+                            # 原始: values.shape = [bs, seq_len]
+                            # 现在: values.shape = [bs,]
+                            # ----------------- END MODIFICATION -----------------
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):

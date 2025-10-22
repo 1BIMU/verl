@@ -752,6 +752,54 @@ def compute_rloo_vectorized_outcome_advantage(
 
     return adv, adv
 
+@register_adv_est("sequence_level_adv")
+def compute_sequence_level_advantage(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算序列级的优势 A = R - V(s_prompt)。
+
+    Args:
+        token_level_rewards (torch.Tensor): 
+            形状为 (bs, response_length)。
+            我们假设这个的总和是最终的序列奖励 R (1 或 0)。
+        values (torch.Tensor): 
+            这是 V(s_prompt)，由修改后的 critic 返回。
+            形状为 (bs,)。
+        response_mask (torch.Tensor): 
+            形状为 (bs, response_length)。
+        config (Optional[AlgoConfig]): 算法配置。
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - advantages: 形状 (bs, response_length)。广播后的序列级优势。
+            - returns: 形状 (bs,)。这是目标 R (1或0)，用于 V-loss 计算。
+    """
+    with torch.no_grad():
+        # 1. 计算 R (最终序列奖励)
+        # 假设 R 是 token_level_rewards 的总和 (例如，答对为1，其余为0)
+        R = token_level_rewards.sum(dim=-1)  # 形状变为 (bs,)
+
+        # 2. 获取 V(s_prompt)
+        # 'values' 已经是 V(s_prompt)，形状为 (bs,)
+        V_s_prompt = values
+
+        # 3. 计算优势 A = R - V(s_prompt)
+        adv = R - V_s_prompt  # 形状 (bs,)
+
+        # 4. 将优势 A 广播到每个 token
+        # (bs,) -> (bs, 1) -> (bs, response_length)
+        advantages = adv.unsqueeze(-1) * response_mask
+
+        # 5. "returns" 字段现在用于存储 Critic 的目标 R (1或0)
+        # 它将传递给 update_critic
+        returns_target_R = R  # 形状 (bs,)
+
+        return advantages, returns_target_R
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.

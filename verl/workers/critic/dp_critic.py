@@ -49,7 +49,69 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
+        self.bce_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
 
+    def _forward_prompt_value(self, micro_batch):
+        """
+        [新函数] 
+        只对 prompt (不含 response) 运行 V-model，并返回一个标量 logit。
+        """
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch.keys():
+            from verl.utils.model import extract_multi_modal_inputs
+            multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            # 这些是 prompt_only 的输入
+            input_ids = micro_batch["prompt_input_ids"]
+            attention_mask = micro_batch["prompt_attention_mask"]
+            position_ids = micro_batch["prompt_position_ids"]
+            if position_ids.dim() == 3:
+                position_ids = position_ids.transpose(0, 1)
+
+            # 假设 V-model (critic_module) 运行
+            output = self.critic_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **multi_modal_inputs,
+                use_cache=False,
+                output_hidden_states=True, # 确保我们能拿到 hidden states
+            )
+
+            # 从 TRL 的 AutoModelForCausalLMWithValueHead 结构中获取 v_head 的输出
+            if hasattr(self.critic_module, "v_head"):
+                # (batch_size, prompt_seq_len, hidden_dim)
+                hidden_states = output.hidden_states[-1] 
+                # (batch_size, prompt_seq_len, 1)
+                values_seq = self.critic_module.v_head(hidden_states)
+
+                # 我们需要最后一个 non-padded token 的 value
+                if attention_mask is not None:
+                    # (batch_size,)
+                    last_token_indices = attention_mask.sum(1) - 1 
+                    # (batch_size,)
+                    prompt_value_logit = values_seq[
+                        torch.arange(values_seq.shape[0], device=values_seq.device), last_token_indices
+                    ].squeeze(-1)
+                else:
+                    # (batch_size,)
+                    prompt_value_logit = values_seq[:, -1].squeeze(-1)
+
+            else:
+                # 备用逻辑：如果 v_head 只是 logits
+                logits = output.logits # (batch_size, prompt_seq_len, 1)
+                if attention_mask is not None:
+                    last_token_indices = attention_mask.sum(1) - 1
+                    prompt_value_logit = logits[
+                        torch.arange(logits.shape[0], device=logits.device), last_token_indices
+                    ].squeeze(-1)
+                else:
+                    prompt_value_logit = logits[:, -1].squeeze(-1)
+            
+            # 返回形状为 (batch_size,) 的标量 logits
+            return prompt_value_logit
+        
     def _forward_micro_batch(self, micro_batch):
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -152,91 +214,156 @@ class DataParallelPPOCritic(BasePPOCritic):
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def compute_values(self, data: DataProto) -> torch.Tensor:
         self.critic_module.eval()
+        
+        # --- 新逻辑：准备 prompt-only 输入 ---
+        response_length = data.batch["responses"].size(-1)
+        # 假设 response 总是在 input_ids 的末尾
+        prompt_input_ids = data.batch["input_ids"][:, :-response_length]
+        prompt_attention_mask = data.batch["attention_mask"][:, :-response_length]
+        
+        pos_ids = data.batch["position_ids"]
+        if pos_ids.dim() == 3: # (c, b, s)
+            prompt_position_ids = pos_ids[:, :, :-response_length]
+        else: # (b, s)
+            prompt_position_ids = pos_ids[:, :-response_length]
+
+        prompt_data_batch = {
+            "prompt_input_ids": prompt_input_ids,
+            "prompt_attention_mask": prompt_attention_mask,
+            "prompt_position_ids": prompt_position_ids,
+        }
+        prompt_data_non_tensor = {}
+        if "multi_modal_inputs" in data.non_tensor_batch.keys():
+            prompt_data_non_tensor["multi_modal_inputs"] = data.non_tensor_batch["multi_modal_inputs"]
+        
+        prompt_data = DataProto(
+            batch=prompt_data_batch,
+            non_tensor_batch=prompt_data_non_tensor,
+            meta_info=data.meta_info
+        )
+        # --- 结束新逻辑 ---
+
         micro_batch_size = data.meta_info["micro_batch_size"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        select_keys = (
-            ["responses", "input_ids", "response_mask", "attention_mask", "position_ids"]
-            if "response_mask" in data.batch
-            else ["responses", "input_ids", "attention_mask", "position_ids"]
-        )
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
-
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
+        
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(prompt_data, max_token_len=max_token_len)
         else:
-            micro_batches = data.split(micro_batch_size)
+            micro_batches = prompt_data.split(micro_batch_size)
 
         values_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                values = self._forward_micro_batch(model_inputs)
+                # 调用新的 prompt-only forward 函数
+                values = self._forward_prompt_value(model_inputs) # (micro_batch_size)
             values_lst.append(values)
+        
+        # values.shape = (batch_size,)
         values = torch.concat(values_lst, dim=0)
 
         if use_dynamic_bsz:
             values = restore_dynamic_batch(values, batch_idx_list)
 
-        if "response_mask" in data.batch:
-            response_mask = data.batch["response_mask"]
-            response_mask = response_mask.to(values.device)
-            values = values * response_mask  # Only action tokens have values
+        # 返回 V(s_prompt) logits
         return values
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def update_critic(self, data: DataProto):
-        # make sure we are in training mode
         self.critic_module.train()
         metrics = {}
 
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        # --- 修改 select_keys ---
+        # "values" 是旧的 V(s_prompt) logits, 形状 [bs,]
+        # "returns" 是目标 R (1或0), 形状 [bs,]
+        select_keys = [
+            "input_ids", "responses", "response_mask", "attention_mask", "position_ids",
+            "values",  
+            "returns" 
+        ]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                
+                # --- 准备 prompt-only 输入 ---
+                response_length = mini_batch.batch["responses"].size(-1)
+                prompt_input_ids = mini_batch.batch["input_ids"][:, :-response_length]
+                prompt_attention_mask = mini_batch.batch["attention_mask"][:, :-response_length]
+                pos_ids = mini_batch.batch["position_ids"]
+                if pos_ids.dim() == 3:
+                    prompt_position_ids = pos_ids[:, :, :-response_length]
+                else:
+                    prompt_position_ids = pos_ids[:, :-response_length]
+
+                prompt_mb_batch = {
+                    "prompt_input_ids": prompt_input_ids,
+                    "prompt_attention_mask": prompt_attention_mask,
+                    "prompt_position_ids": prompt_position_ids,
+                }
+                prompt_mb_non_tensor = {}
+                if has_multi_modal_inputs:
+                    prompt_mb_non_tensor["multi_modal_inputs"] = mini_batch.non_tensor_batch["multi_modal_inputs"]
+
+                # 目标 R (1或0)
+                R_targets = mini_batch.batch["returns"] # 形状 [mini_batch_size]
+
+                prompt_micro_batch_data = DataProto(
+                    batch=prompt_mb_batch,
+                    non_tensor_batch=prompt_mb_non_tensor,
+                    meta_info=mini_batch.meta_info
+                )
+                
                 if self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    # ... (动态批处理逻辑)
+                    # 警告: 动态批处理可能需要更复杂的 R_targets 分割
+                    raise NotImplementedError("动态批处理与序列级V-loss尚未实现")
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    # 分割目标 R
+                    R_targets_micro_batches = R_targets.split(self.config.ppo_micro_batch_size_per_gpu)
+                    prompt_micro_batches = prompt_micro_batch_data.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.critic_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch_idx, micro_batch in enumerate(prompt_micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
-                    values = model_inputs["values"]
-                    returns = model_inputs["returns"]
 
-                    vpreds = self._forward_micro_batch(model_inputs)
-                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                        vpreds=vpreds,
-                        values=values,
-                        returns=returns,
-                        response_mask=response_mask,
-                        cliprange_value=self.config.cliprange_value,
-                        loss_agg_mode=self.config.loss_agg_mode,
-                    )
+                    # 获取对应的 R 目标
+                    R_targets_micro = R_targets_micro_batches[micro_batch_idx].to(get_device_id())
+                    R_targets_micro_float = R_targets_micro.float()
+
+                    # --- 新的 V-Loss 计算 ---
+                    
+                    # 1. 获取新的 V(s_prompt) logits
+                    vpreds_logits = self._forward_prompt_value(model_inputs) # 形状 [micro_bs]
+                    
+                    # 2. 计算 BCE loss
+                    # vpreds_logits: [micro_bs] (logits)
+                    # R_targets_micro_float: [micro_bs] (labels, 0.0 or 1.0)
+                    vf_loss_per_sample = self.bce_loss_fn(vpreds_logits, R_targets_micro_float)
+                    
+                    # 3. 聚合 loss
+                    vf_loss = vf_loss_per_sample.mean()
+
+                    # (我们不再使用 cliprange_value，所以 clipfrac 为 0)
+                    vf_clipfrac = torch.tensor(0.0, device=vf_loss.device)
+                    
+                    # --- 结束新的 V-Loss 计算 ---
+                    
                     if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        loss_scale_factor = micro_batch.batch["prompt_input_ids"].shape[0] / self.config.ppo_mini_batch_size
                         loss = vf_loss * loss_scale_factor
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -248,14 +375,15 @@ class DataParallelPPOCritic(BasePPOCritic):
                         {
                             "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
                             "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                            # 记录预测的平均成功率
+                            "critic/vpred_prob_mean": torch.sigmoid(vpreds_logits).mean().detach().item(),
                         }
                     )
-
                     append_to_dict(metrics, micro_batch_metrics)
-
+                
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"critic/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+
         self.critic_optimizer.zero_grad()
         return metrics
