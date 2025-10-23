@@ -752,6 +752,10 @@ def compute_rloo_vectorized_outcome_advantage(
 
     return adv, adv
 
+# In verl/trainer/ppo/core_algos.py
+
+# ... (在所有 @register_adv_est 装饰器之后)
+
 @register_adv_est("sequence_level_adv")
 def compute_sequence_level_advantage(
     token_level_rewards: torch.Tensor,
@@ -761,17 +765,16 @@ def compute_sequence_level_advantage(
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    计算序列级的优势 A = R - V(s_prompt)。
+    计算序列级的优势 A = R - sigmoid(V_logit)。
 
     Args:
         token_level_rewards (torch.Tensor): 
-            形状为 (bs, response_length)。
-            我们假设这个的总和是最终的序列奖励 R (1 或 0)。
+            形状 (bs, response_length)。其总和假定为 R。
         values (torch.Tensor): 
-            这是 V(s_prompt)，由修改后的 critic 返回。
-            形状为 (bs,)。
+            这是 V(s_prompt) 的 Logit 输出, 由 critic 返回。
+            形状 (bs,)。
         response_mask (torch.Tensor): 
-            形状为 (bs, response_length)。
+            形状 (bs, response_length)。
         config (Optional[AlgoConfig]): 算法配置。
 
     Returns:
@@ -781,22 +784,23 @@ def compute_sequence_level_advantage(
     """
     with torch.no_grad():
         # 1. 计算 R (最终序列奖励)
-        # 假设 R 是 token_level_rewards 的总和 (例如，答对为1，其余为0)
-        R = token_level_rewards.sum(dim=-1)  # 形状变为 (bs,)
+        R = token_level_rewards.sum(dim=-1)  # 形状 (bs,)
 
-        # 2. 获取 V(s_prompt)
-        # 'values' 已经是 V(s_prompt)，形状为 (bs,)
-        V_s_prompt = values
+        # 2. 获取 V(s_prompt) logit
+        V_s_prompt_logit = values # 形状 (bs,)
 
-        # 3. 计算优势 A = R - V(s_prompt)
-        adv = R - V_s_prompt  # 形状 (bs,)
+        # ----------------- MODIFICATION -----------------
+        # 3. 将 logit 转换为概率
+        V_s_prompt_prob = torch.sigmoid(V_s_prompt_logit)
 
-        # 4. 将优势 A 广播到每个 token
-        # (bs,) -> (bs, 1) -> (bs, response_length)
+        # 4. 在概率空间计算优势 A = R - sigmoid(V)
+        adv = R - V_s_prompt_prob  # 形状 (bs,)
+        # ----------------- END MODIFICATION -----------------
+
+        # 5. 将优势 A 广播到每个 token
         advantages = adv.unsqueeze(-1) * response_mask
 
-        # 5. "returns" 字段现在用于存储 Critic 的目标 R (1或0)
-        # 它将传递给 update_critic
+        # 6. "returns" 字段存储 Critic 的目标 R (1或0)
         returns_target_R = R  # 形状 (bs,)
 
         return advantages, returns_target_R
