@@ -3,9 +3,9 @@ set -x
 
 export CUDA_VISIBLE_DEVICES=0
 
-train_path=/workspace/Reasoning360/data/dapo-math-17k.parquet
-aime_test_path=/workspace/Reasoning360/data/offline_eval/math__aime_repeated_8x_240.parquet
-math_test_path=/workspace/Reasoning360/data/offline_eval/math__math_500.parquet
+train_path=data/dapo-math-17k_dedup.parquet
+aime_test_path=data/offline_eval/math__aime_repeated_8x_240.parquet
+math_test_path=data/offline_eval/math__math_500.parquet
 
 train_files="['$train_path']"
 test_files="['$aime_test_path', '$math_test_path']"
