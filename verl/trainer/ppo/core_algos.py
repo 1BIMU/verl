@@ -789,14 +789,14 @@ def compute_sequence_level_advantage(
         # 2. 获取 V(s_prompt) logit
         V_s_prompt_logit = values # 形状 (bs,)
 
-        # ----------------- MODIFICATION -----------------
-        # 3. 将 logit 转换为概率
-        V_s_prompt_prob = torch.sigmoid(V_s_prompt_logit)
+        adv_if_R1 = torch.exp(-V_s_prompt_logit / 2.0)
+        
+        # 公式: 如果 R=0, A = -exp(V_logit / 2)
+        adv_if_R0 = -torch.exp(V_s_prompt_logit / 2.0)
 
-        # 4. 在概率空间计算优势 A = R - sigmoid(V)
-        adv = R - V_s_prompt_prob  # 形状 (bs,)
-        # ----------------- END MODIFICATION -----------------
-
+        # 4. 使用 torch.where 根据 R (0或1) 来选择
+        # (我们假设 R 是 0.0 或 1.0)
+        adv = torch.where(R.bool(), adv_if_R1, adv_if_R0) # 形状 (bs,)
         # 5. 将优势 A 广播到每个 token
         advantages = adv.unsqueeze(-1) * response_mask
 
