@@ -11,7 +11,7 @@ train_files="['$train_path']"
 test_files="['$aime_test_path', '$math_test_path']"
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=gae \
+    algorithm.adv_estimator=sequence_level_adv \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=256 \
@@ -29,9 +29,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=False \
     critic.model.path=/workspace/models/Qwen2.5-0.5B-Instruct \
@@ -41,7 +41,7 @@ python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=False \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","swanlab"]' \
+    trainer.logger='["console","wandb"]' \
     trainer.default_local_dir='/workspace/Reasoning360/SQPPO' \
     trainer.project_name='PPO' \
     trainer.experiment_name='qwen0.5B_PPO_SEQUENCE' \
@@ -49,4 +49,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=10 \
-    trainer.total_epochs=100 $@
+    trainer.total_epochs=10 $@
