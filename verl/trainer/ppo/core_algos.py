@@ -752,12 +752,57 @@ def compute_rloo_vectorized_outcome_advantage(
 
     return adv, adv
 
-# In verl/trainer/ppo/core_algos.py
-
-# ... (在所有 @register_adv_est 装饰器之后)
 
 @register_adv_est("sequence_level_adv")
 def compute_sequence_level_advantage(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算序列级的优势 A = R - sigmoid(V_logit)。
+
+    Args:
+        token_level_rewards (torch.Tensor): 
+            形状 (bs, response_length)。其总和假定为 R。
+        values (torch.Tensor): 
+            这是 V(s_prompt) 的 Logit 输出, 由 critic 返回。
+            形状 (bs,)。
+        response_mask (torch.Tensor): 
+            形状 (bs, response_length)。
+        config (Optional[AlgoConfig]): 算法配置。
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - advantages: 形状 (bs, response_length)。广播后的序列级优势。
+            - returns: 形状 (bs,)。这是目标 R (1或0)，用于 V-loss 计算。
+    """
+    with torch.no_grad():
+        # 1. 计算 R (最终序列奖励)
+        R = token_level_rewards.sum(dim=-1)  # 形状 (bs,)
+
+        # 2. 获取 V(s_prompt) logit
+        V_s_prompt_logit = values # 形状 (bs,)
+
+        # 3. 将 logit 转换为概率
+        V_s_prompt_prob = torch.sigmoid(V_s_prompt_logit)
+
+        # 4. 在概率空间计算优势 A = R - sigmoid(V)
+        adv = R - V_s_prompt_prob  # 形状 (bs,)
+
+
+        # 5. 将优势 A 广播到每个 token
+        advantages = adv.unsqueeze(-1) * response_mask
+
+        # 6. "returns" 字段存储 Critic 的目标 R (1或0)
+        returns_target_R = R  # 形状 (bs,)
+
+        return advantages, returns_target_R
+
+@register_adv_est("sequence_level_adv_pro")
+def compute_sequence_level_advantage_pro(
     token_level_rewards: torch.Tensor,
     values: torch.Tensor,
     response_mask: torch.Tensor,
@@ -804,7 +849,6 @@ def compute_sequence_level_advantage(
         returns_target_R = R  # 形状 (bs,)
 
         return advantages, returns_target_R
-
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.
 
