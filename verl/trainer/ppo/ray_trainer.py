@@ -249,7 +249,7 @@ def compute_advantage(
             "config": config,
         }
         # 我们的新 estimator 需要 'values'
-        if adv_estimator == "sequence_level_adv":
+        if adv_estimator == "sequence_level_adv" or adv_estimator == "sequence_level_adv_pro":
             adv_kwargs["values"] = data.batch["values"]
         if "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
